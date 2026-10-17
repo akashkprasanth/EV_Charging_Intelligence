@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+
+# Secrets and credentials
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Local database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Backup files
+app_backup.py
+
+# Temporary files
+*.log

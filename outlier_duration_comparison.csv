@@ -1,0 +1,3 @@
+energy_group,session_count,average_energy_kwh,median_energy_kwh,average_charging_minutes,median_charging_minutes
+High-energy outlier,222,45.65678378378379,42.9345,417.7778985507246,385.8083333333333
+Normal,2812,9.721910401308566,6.3915,99.65366666666667,80.3
