@@ -1,92 +1,114 @@
 import streamlit as st
 import pandas as pd
-import mysql.connector
-
-# ==================================================
-# PAGE CONFIGURATION
-# ==================================================
+import plotly.express as px
 
 st.set_page_config(
     page_title="Station Performance",
-    page_icon="🔌",
+    page_icon="🏭",
     layout="wide"
 )
 
-st.title("🔌 Charging Station Performance")
-st.caption(
-    "Compare station utilization, energy delivery, and charging behavior."
+st.title("🏭 EV Charging Station Performance")
+st.markdown(
+    "Compare charging stations by session volume, "
+    "energy delivery, and charging efficiency."
 )
 
-# ==================================================
-# LOAD DATA FROM MYSQL
-# ==================================================
 
-@st.cache_data(ttl=60)
+# --------------------------------------------------
+# LOAD DATA
+# --------------------------------------------------
+
+@st.cache_data
 def load_data():
+    df = pd.read_csv("ev_charging_cleaned.csv")
 
-    connection = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password=st.secrets["mysql"]["password"],
-        database="ev_charging_db"
-    )
+    column_mapping = {
+        "_id": "record_id",
+        "clusterID": "cluster_id",
+        "connectionTime": "connection_time",
+        "disconnectTime": "disconnect_time",
+        "doneChargingTime": "done_charging_time",
+        "kWhDelivered": "energy_kwh",
+        "sessionID": "session_id",
+        "siteID": "site_id",
+        "spaceID": "space_id",
+        "stationID": "station_id",
+        "userID": "user_id",
+        "userInputs": "user_inputs"
+    }
 
-    try:
-        query = """
-            SELECT
-                session_id,
-                connection_time,
-                disconnect_time,
-                energy_kwh,
-                station_id
-            FROM charging_sessions
-        """
+    df = df.rename(columns=column_mapping)
 
-        df = pd.read_sql(query, connection)
+    required = [
+        "session_id",
+        "station_id",
+        "connection_time",
+        "disconnect_time",
+        "energy_kwh"
+    ]
 
-    finally:
-        connection.close()
+    missing = [col for col in required if col not in df.columns]
 
-    df["connection_time"] = pd.to_datetime(
-        df["connection_time"],
-        errors="coerce"
-    )
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    df["disconnect_time"] = pd.to_datetime(
-        df["disconnect_time"],
-        errors="coerce"
-    )
+    for col in [
+        "connection_time",
+        "disconnect_time",
+        "done_charging_time"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(
+                df[col],
+                errors="coerce",
+                utc=True
+            )
 
     df["energy_kwh"] = pd.to_numeric(
         df["energy_kwh"],
         errors="coerce"
     )
 
-    # Connection duration in minutes
-    df["connection_duration_minutes"] = (
+    # Calculate how long the vehicle remained connected.
+    df["connection_duration_hours"] = (
         df["disconnect_time"] - df["connection_time"]
-    ).dt.total_seconds() / 60
+    ).dt.total_seconds() / 3600
+
+    # Calculate actual charging duration when available.
+    df["charging_duration_hours"] = (
+        df["done_charging_time"] - df["connection_time"]
+    ).dt.total_seconds() / 3600
+
+    # Ignore negative or invalid duration values.
+    df.loc[
+        df["connection_duration_hours"] < 0,
+        "connection_duration_hours"
+    ] = float("nan")
+
+    df.loc[
+        df["charging_duration_hours"] < 0,
+        "charging_duration_hours"
+    ] = float("nan")
 
     return df
 
 
 try:
     df = load_data()
-
 except Exception as error:
-    st.error("Unable to load station data from MySQL.")
-    st.code(str(error))
+    st.error(f"Unable to load station data: {error}")
     st.stop()
 
 
-# ==================================================
-# SIDEBAR FILTERS
-# ==================================================
+# --------------------------------------------------
+# FILTERS
+# --------------------------------------------------
 
-st.sidebar.header("Station Filters")
+st.sidebar.header("🔎 Station Filters")
 
 stations = sorted(
-    df["station_id"].dropna().unique().tolist()
+    df["station_id"].dropna().astype(str).unique().tolist()
 )
 
 selected_stations = st.sidebar.multiselect(
@@ -95,18 +117,20 @@ selected_stations = st.sidebar.multiselect(
     default=stations
 )
 
+df["station_id"] = df["station_id"].astype(str)
+
 filtered_df = df[
     df["station_id"].isin(selected_stations)
 ].copy()
 
 if filtered_df.empty:
-    st.warning("Please select at least one station.")
+    st.warning("No data available for the selected stations.")
     st.stop()
 
 
-# ==================================================
-# STATION PERFORMANCE TABLE
-# ==================================================
+# --------------------------------------------------
+# STATION SUMMARY
+# --------------------------------------------------
 
 station_summary = (
     filtered_df.groupby("station_id")
@@ -114,24 +138,36 @@ station_summary = (
         total_sessions=("session_id", "count"),
         total_energy_kwh=("energy_kwh", "sum"),
         average_energy_kwh=("energy_kwh", "mean"),
-        average_connection_minutes=(
-            "connection_duration_minutes", "mean"
+        average_connection_hours=(
+            "connection_duration_hours", "mean"
+        ),
+        average_charging_hours=(
+            "charging_duration_hours", "mean"
         ),
         maximum_energy_kwh=("energy_kwh", "max")
     )
     .reset_index()
 )
 
-# Calculate energy contribution within selected stations
-total_energy = station_summary["total_energy_kwh"].sum()
+station_summary["total_energy_kwh"] = (
+    station_summary["total_energy_kwh"].round(2)
+)
 
-if total_energy > 0:
-    station_summary["energy_share_percent"] = (
-        station_summary["total_energy_kwh"]
-        / total_energy * 100
-    )
-else:
-    station_summary["energy_share_percent"] = 0
+station_summary["average_energy_kwh"] = (
+    station_summary["average_energy_kwh"].round(2)
+)
+
+station_summary["average_connection_hours"] = (
+    station_summary["average_connection_hours"].round(2)
+)
+
+station_summary["average_charging_hours"] = (
+    station_summary["average_charging_hours"].round(2)
+)
+
+station_summary["maximum_energy_kwh"] = (
+    station_summary["maximum_energy_kwh"].round(2)
+)
 
 station_summary = station_summary.sort_values(
     "total_energy_kwh",
@@ -139,85 +175,35 @@ station_summary = station_summary.sort_values(
 )
 
 
-# ==================================================
-# KPI METRICS
-# ==================================================
+# --------------------------------------------------
+# KEY METRICS
+# --------------------------------------------------
 
-st.subheader("📊 Performance Overview")
-
-top_station = station_summary.iloc[0]
-
-total_sessions = len(filtered_df)
 total_stations = filtered_df["station_id"].nunique()
+total_sessions = len(filtered_df)
+total_energy = filtered_df["energy_kwh"].sum()
 
-average_energy = filtered_df["energy_kwh"].mean()
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Charging Stations",
-    f"{total_stations:,}"
+top_station = (
+    station_summary.iloc[0]["station_id"]
+    if not station_summary.empty
+    else "N/A"
 )
 
-col2.metric(
-    "Total Sessions",
-    f"{total_sessions:,}"
-)
+c1, c2, c3, c4 = st.columns(4)
 
-col3.metric(
-    "Total Energy Delivered",
-    f"{total_energy:,.2f} kWh"
-)
-
-col4.metric(
-    "Average Energy / Session",
-    f"{average_energy:.2f} kWh"
-    if pd.notna(average_energy) else "N/A"
-)
+c1.metric("Charging Stations", f"{total_stations:,}")
+c2.metric("Total Sessions", f"{total_sessions:,}")
+c3.metric("Total Energy", f"{total_energy:,.2f} kWh")
+c4.metric("Top Station by Energy", top_station)
 
 st.divider()
 
 
-# ==================================================
-# TOP STATIONS BY ENERGY
-# ==================================================
-
-st.subheader("🏆 Top 10 Stations by Energy")
-
-top_energy = station_summary.head(10)
-
-chart_col, table_col = st.columns([1, 1.3])
-
-with chart_col:
-    st.bar_chart(
-        top_energy.set_index("station_id")["total_energy_kwh"],
-        x_label="Station",
-        y_label="Energy (kWh)"
-    )
-
-with table_col:
-    st.dataframe(
-        top_energy[
-            [
-                "station_id",
-                "total_sessions",
-                "total_energy_kwh",
-                "average_energy_kwh",
-                "energy_share_percent"
-            ]
-        ].round(2),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ==================================================
+# --------------------------------------------------
 # TOP STATIONS BY SESSION COUNT
-# ==================================================
+# --------------------------------------------------
 
-st.divider()
-
-st.subheader("🔌 Top 10 Stations by Charging Sessions")
+st.subheader("📊 Top Stations by Charging Sessions")
 
 top_sessions = (
     station_summary
@@ -225,138 +211,257 @@ top_sessions = (
     .head(10)
 )
 
-st.bar_chart(
-    top_sessions.set_index("station_id")["total_sessions"],
-    x_label="Station",
-    y_label="Number of Sessions"
+fig_sessions = px.bar(
+    top_sessions,
+    x="station_id",
+    y="total_sessions",
+    title="Top 10 Stations by Number of Sessions",
+    labels={
+        "station_id": "Charging Station",
+        "total_sessions": "Total Sessions"
+    },
+    text="total_sessions"
 )
 
+fig_sessions.update_layout(xaxis_tickangle=-45)
 
-# ==================================================
-# AVERAGE ENERGY COMPARISON
-# ==================================================
+st.plotly_chart(fig_sessions, use_container_width=True)
 
-st.divider()
 
-st.subheader("⚡ Average Energy Delivered per Session")
+# --------------------------------------------------
+# TOP STATIONS BY ENERGY
+# --------------------------------------------------
 
-top_average = (
-    station_summary[
-        station_summary["total_sessions"] >= 10
-    ]
-    .sort_values("average_energy_kwh", ascending=False)
+st.subheader("⚡ Top Stations by Energy Delivered")
+
+top_energy = (
+    station_summary
+    .sort_values("total_energy_kwh", ascending=False)
     .head(10)
 )
 
-st.caption(
-    "Only stations with at least 10 recorded sessions are included "
-    "to reduce the influence of stations with very small samples."
+fig_energy = px.bar(
+    top_energy,
+    x="station_id",
+    y="total_energy_kwh",
+    title="Top 10 Stations by Total Energy Delivered",
+    labels={
+        "station_id": "Charging Station",
+        "total_energy_kwh": "Energy Delivered (kWh)"
+    },
+    text="total_energy_kwh"
 )
 
-if not top_average.empty:
-    st.bar_chart(
-        top_average.set_index("station_id")["average_energy_kwh"],
-        x_label="Station",
-        y_label="Average Energy (kWh)"
+fig_energy.update_layout(xaxis_tickangle=-45)
+
+st.plotly_chart(fig_energy, use_container_width=True)
+
+
+# --------------------------------------------------
+# AVERAGE ENERGY PER SESSION
+# --------------------------------------------------
+
+st.subheader("🔋 Average Energy per Session")
+
+average_energy_stations = station_summary.sort_values(
+    "average_energy_kwh",
+    ascending=False
+).head(10)
+
+fig_average = px.bar(
+    average_energy_stations,
+    x="station_id",
+    y="average_energy_kwh",
+    title="Top 10 Stations by Average Energy per Session",
+    labels={
+        "station_id": "Charging Station",
+        "average_energy_kwh": "Average Energy (kWh)"
+    },
+    text="average_energy_kwh"
+)
+
+fig_average.update_layout(xaxis_tickangle=-45)
+
+st.plotly_chart(fig_average, use_container_width=True)
+
+
+# --------------------------------------------------
+# ENERGY CONTRIBUTION
+# --------------------------------------------------
+
+st.subheader("🌍 Station Energy Contribution")
+
+energy_share = station_summary[
+    ["station_id", "total_energy_kwh"]
+].copy()
+
+total_station_energy = energy_share["total_energy_kwh"].sum()
+
+if total_station_energy > 0:
+    energy_share["energy_share_percent"] = (
+        energy_share["total_energy_kwh"]
+        / total_station_energy
+        * 100
     )
 
+    pie_data = energy_share.head(10).copy()
 
-# ==================================================
-# CONNECTION DURATION ANALYSIS
-# ==================================================
+    if len(energy_share) > 10:
+        other_energy = energy_share.iloc[10:]["total_energy_kwh"].sum()
 
-st.divider()
+        if other_energy > 0:
+            pie_data = pd.concat(
+                [
+                    pie_data,
+                    pd.DataFrame(
+                        [{
+                            "station_id": "Other Stations",
+                            "total_energy_kwh": other_energy
+                        }]
+                    )
+                ],
+                ignore_index=True
+            )
 
-st.subheader("⏱️ Average Connection Duration by Station")
+    fig_share = px.pie(
+        pie_data,
+        names="station_id",
+        values="total_energy_kwh",
+        title="Share of Total Energy Delivered"
+    )
 
-duration_summary = (
-    station_summary[
-        station_summary["total_sessions"] >= 10
+    st.plotly_chart(fig_share, use_container_width=True)
+
+
+# --------------------------------------------------
+# DURATION COMPARISON
+# --------------------------------------------------
+
+st.subheader("⏱️ Station Connection vs Charging Duration")
+
+duration_data = station_summary[
+    [
+        "station_id",
+        "average_connection_hours",
+        "average_charging_hours"
     ]
-    .sort_values("average_connection_minutes", ascending=False)
-    .head(10)
+].copy()
+
+duration_data = duration_data.dropna(
+    subset=[
+        "average_connection_hours",
+        "average_charging_hours"
+    ]
 )
 
-duration_summary["average_connection_hours"] = (
-    duration_summary["average_connection_minutes"] / 60
-)
+if not duration_data.empty:
+    duration_long = duration_data.melt(
+        id_vars="station_id",
+        value_vars=[
+            "average_connection_hours",
+            "average_charging_hours"
+        ],
+        var_name="duration_type",
+        value_name="hours"
+    )
+
+    duration_long["duration_type"] = duration_long[
+        "duration_type"
+    ].map({
+        "average_connection_hours": "Connection Duration",
+        "average_charging_hours": "Charging Duration"
+    })
+
+    fig_duration = px.bar(
+        duration_long,
+        x="station_id",
+        y="hours",
+        color="duration_type",
+        barmode="group",
+        title="Average Connection and Charging Duration",
+        labels={
+            "station_id": "Charging Station",
+            "hours": "Average Hours",
+            "duration_type": "Duration Type"
+        }
+    )
+
+    fig_duration.update_layout(xaxis_tickangle=-45)
+
+    st.plotly_chart(fig_duration, use_container_width=True)
+
+    st.caption(
+        "Connection duration measures how long a vehicle remains connected. "
+        "Charging duration is calculated only when a charging completion "
+        "timestamp is available. The two measurements are not equivalent."
+    )
+else:
+    st.info("Not enough valid duration data to display this comparison.")
+
+
+# --------------------------------------------------
+# STATION PERFORMANCE TABLE
+# --------------------------------------------------
+
+st.subheader("📋 Station Performance Summary")
 
 st.dataframe(
-    duration_summary[
-        [
-            "station_id",
-            "total_sessions",
-            "average_connection_hours"
-        ]
-    ].round(2),
+    station_summary,
     use_container_width=True,
     hide_index=True
 )
 
-st.caption(
-    "Connection duration is the time between connecting and disconnecting "
-    "a vehicle. It is not necessarily the same as actual charging time."
+st.download_button(
+    label="📥 Download Station Performance CSV",
+    data=station_summary.to_csv(index=False).encode("utf-8"),
+    file_name="station_performance_summary.csv",
+    mime="text/csv"
 )
 
 
-# ==================================================
+# --------------------------------------------------
 # BUSINESS INSIGHTS
-# ==================================================
-
-st.divider()
+# --------------------------------------------------
 
 st.subheader("💡 Business Insights")
 
-st.write(
-    f"**Highest total energy:** Station `{top_station['station_id']}` "
-    f"delivered {top_station['total_energy_kwh']:,.2f} kWh."
-)
+if not station_summary.empty:
+    top_row = station_summary.iloc[0]
 
-st.write(
-    f"**Energy contribution:** This station accounts for "
-    f"{top_station['energy_share_percent']:.2f}% of the energy "
-    "delivered by the currently selected stations."
-)
-
-if len(station_summary) > 1:
-
-    lowest_station = station_summary.sort_values(
-        "total_energy_kwh"
+    best_session_station = station_summary.sort_values(
+        "total_sessions",
+        ascending=False
     ).iloc[0]
 
-    st.write(
-        f"**Lowest total energy among selected stations:** "
-        f"`{lowest_station['station_id']}` delivered "
-        f"{lowest_station['total_energy_kwh']:,.2f} kWh."
-    )
+    insight1, insight2, insight3 = st.columns(3)
 
-st.info(
-    "Business recommendation: Compare energy delivered, session counts, "
-    "and connection durations together before deciding whether a station "
-    "is performing well. Low energy may reflect low demand rather than "
-    "poor station performance."
-)
+    with insight1:
+        st.info(
+            f"**Highest Energy Contribution**\n\n"
+            f"Station `{top_row['station_id']}` delivered "
+            f"{top_row['total_energy_kwh']:,.2f} kWh."
+        )
 
+    with insight2:
+        st.info(
+            f"**Most Frequently Used Station**\n\n"
+            f"Station `{best_session_station['station_id']}` "
+            f"recorded {int(best_session_station['total_sessions']):,} sessions."
+        )
 
-# ==================================================
-# COMPLETE STATION TABLE
-# ==================================================
+    with insight3:
+        highest_average = station_summary.sort_values(
+            "average_energy_kwh",
+            ascending=False
+        ).iloc[0]
 
-with st.expander("📋 View All Station Performance Results"):
-
-    st.dataframe(
-        station_summary.round(2),
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# ==================================================
-# FOOTER
-# ==================================================
-
-st.divider()
+        st.info(
+            f"**Highest Average Energy per Session**\n\n"
+            f"Station `{highest_average['station_id']}` averaged "
+            f"{highest_average['average_energy_kwh']:.2f} kWh per session."
+        )
 
 st.caption(
-    "EV Charging Intelligence | Station Performance Analytics"
+    "Data source: EV Charging Sessions dataset. "
+    "Duration metrics are calculated from available timestamps."
 )
