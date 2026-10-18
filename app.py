@@ -137,16 +137,16 @@ except Exception as error:
 
 
 # ==================================================
-# SIDEBAR
+# SIDEBAR FILTERS
 # ==================================================
 
 st.sidebar.title("⚡ EV Analytics")
 st.sidebar.caption("Charging Intelligence Platform")
-
 st.sidebar.divider()
 
 st.sidebar.subheader("Dashboard Filters")
 
+# Station filter
 stations = sorted(
     df["station_id"].dropna().unique().tolist()
 )
@@ -157,21 +157,50 @@ selected_stations = st.sidebar.multiselect(
     default=stations
 )
 
+# Date filter
+valid_dates = df["connection_time"].dropna()
+
+if not valid_dates.empty:
+
+    min_date = valid_dates.min().date()
+    max_date = valid_dates.max().date()
+
+    selected_dates = st.sidebar.date_input(
+        "Select Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date
+    )
+
+else:
+    selected_dates = ()
+
+# Apply filters
 filtered_df = df[
     df["station_id"].isin(selected_stations)
 ].copy()
 
+if len(selected_dates) == 2:
+
+    start_date, end_date = selected_dates
+
+    filtered_df = filtered_df[
+        filtered_df["connection_time"].dt.date.between(
+            start_date,
+            end_date
+        )
+    ]
+
 st.sidebar.divider()
 
 st.sidebar.metric(
-    "Available Stations",
-    f"{len(stations):,}"
+    "Filtered Sessions",
+    f"{len(filtered_df):,}"
 )
 
 st.sidebar.caption(
     "Data source: MySQL | Database: ev_charging_db"
 )
-
 
 # ==================================================
 # KPI CARDS
@@ -373,6 +402,20 @@ with st.expander("🔍 Explore Charging Session Records"):
         hide_index=True
     )
 
+# ==================================================
+# DOWNLOAD FILTERED DATA
+# ==================================================
+
+st.subheader("📥 Export Filtered Data")
+
+csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    label="Download Filtered Sessions (CSV)",
+    data=csv_data,
+    file_name="ev_charging_filtered_sessions.csv",
+    mime="text/csv"
+)
 
 # ==================================================
 # FOOTER
