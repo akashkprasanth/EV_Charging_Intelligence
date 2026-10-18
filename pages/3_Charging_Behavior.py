@@ -1,71 +1,74 @@
 import streamlit as st
 import pandas as pd
-import mysql.connector
-
-# ==================================================
-# PAGE CONFIGURATION
-# ==================================================
+import plotly.express as px
 
 st.set_page_config(
-    page_title="Charging Behavior & Anomalies",
+    page_title="Charging Behavior",
     page_icon="🔍",
     layout="wide"
 )
 
-st.title("🔍 Charging Behavior & Anomaly Analysis")
+st.title("🔍 EV Charging Behavior & Anomaly Analysis")
 
-st.caption(
-    "Investigate long connection times, high-energy sessions, "
-    "and unusual charging behavior."
+st.markdown(
+    "Identify unusual charging sessions, investigate long connections, "
+    "and compare charging behavior across stations."
 )
 
 
-# ==================================================
-# LOAD DATA FROM MYSQL
-# ==================================================
+# --------------------------------------------------
+# LOAD DATA FROM CSV
+# --------------------------------------------------
 
-@st.cache_data(ttl=60)
+@st.cache_data
 def load_data():
+    df = pd.read_csv("ev_charging_cleaned.csv")
 
-    connection = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password=st.secrets["mysql"]["password"],
-        database="ev_charging_db"
-    )
+    column_mapping = {
+        "_id": "record_id",
+        "clusterID": "cluster_id",
+        "connectionTime": "connection_time",
+        "disconnectTime": "disconnect_time",
+        "doneChargingTime": "done_charging_time",
+        "kWhDelivered": "energy_kwh",
+        "sessionID": "session_id",
+        "siteID": "site_id",
+        "spaceID": "space_id",
+        "stationID": "station_id",
+        "userID": "user_id",
+        "userInputs": "user_inputs"
+    }
 
-    try:
-        query = """
-            SELECT
-                session_id,
-                connection_time,
-                disconnect_time,
-                done_charging_time,
-                energy_kwh,
-                station_id
-            FROM charging_sessions
-        """
+    df = df.rename(columns=column_mapping)
 
-        df = pd.read_sql(query, connection)
+    required = [
+        "session_id",
+        "station_id",
+        "connection_time",
+        "disconnect_time",
+        "energy_kwh"
+    ]
 
-    finally:
-        connection.close()
+    missing = [col for col in required if col not in df.columns]
 
-    # Imported database timestamps represent UTC.
-    df["connection_time"] = pd.to_datetime(
-        df["connection_time"], utc=True, errors="coerce"
-    )
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    df["disconnect_time"] = pd.to_datetime(
-        df["disconnect_time"], utc=True, errors="coerce"
-    )
-
-    df["done_charging_time"] = pd.to_datetime(
-        df["done_charging_time"], utc=True, errors="coerce"
-    )
+    for col in [
+        "connection_time",
+        "disconnect_time",
+        "done_charging_time"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(
+                df[col],
+                errors="coerce",
+                utc=True
+            )
 
     df["energy_kwh"] = pd.to_numeric(
-        df["energy_kwh"], errors="coerce"
+        df["energy_kwh"],
+        errors="coerce"
     )
 
     # Calculate connection duration in hours.
@@ -73,31 +76,69 @@ def load_data():
         df["disconnect_time"] - df["connection_time"]
     ).dt.total_seconds() / 3600
 
-    # Actual charging duration where a completion timestamp exists.
+    # Calculate charging duration when a completion timestamp exists.
     df["charging_duration_hours"] = (
         df["done_charging_time"] - df["connection_time"]
     ).dt.total_seconds() / 3600
 
-    return df
+    # Remove invalid negative durations.
+    df.loc[
+        df["connection_duration_hours"] < 0,
+        "connection_duration_hours"
+    ] = float("nan")
+
+    df.loc[
+        df["charging_duration_hours"] < 0,
+        "charging_duration_hours"
+    ] = float("nan")
+
+    # Flag unusually long connections.
+    df["long_connection"] = (
+        df["connection_duration_hours"] > 4
+    )
+
+    # Identify high-energy outliers using the IQR method.
+    valid_energy = df["energy_kwh"].dropna()
+
+    if len(valid_energy) > 0:
+        q1 = valid_energy.quantile(0.25)
+        q3 = valid_energy.quantile(0.75)
+        iqr = q3 - q1
+        upper_bound = q3 + 1.5 * iqr
+    else:
+        upper_bound = float("inf")
+
+    df["high_energy_outlier"] = (
+        df["energy_kwh"] > upper_bound
+    )
+
+    # Long connection with low energy is an investigation flag,
+    # not proof of a faulty charger or abnormal behavior.
+    median_energy = df["energy_kwh"].median()
+
+    df["long_connection_low_energy"] = (
+        df["long_connection"]
+        & (df["energy_kwh"] < median_energy)
+    )
+
+    return df, upper_bound
 
 
 try:
-    df = load_data()
-
+    df, energy_upper_bound = load_data()
 except Exception as error:
-    st.error("Unable to load charging data from MySQL.")
-    st.code(str(error))
+    st.error(f"Unable to load charging data: {error}")
     st.stop()
 
 
-# ==================================================
-# SIDEBAR FILTERS
-# ==================================================
+# --------------------------------------------------
+# FILTERS
+# --------------------------------------------------
 
-st.sidebar.header("Analysis Filters")
+st.sidebar.header("🔎 Behavior Filters")
 
 stations = sorted(
-    df["station_id"].dropna().unique().tolist()
+    df["station_id"].dropna().astype(str).unique().tolist()
 )
 
 selected_stations = st.sidebar.multiselect(
@@ -106,64 +147,41 @@ selected_stations = st.sidebar.multiselect(
     default=stations
 )
 
-duration_threshold = st.sidebar.slider(
+connection_threshold = st.sidebar.slider(
     "Long connection threshold (hours)",
     min_value=1,
     max_value=24,
     value=4
 )
 
+df["station_id"] = df["station_id"].astype(str)
+
 filtered_df = df[
     df["station_id"].isin(selected_stations)
 ].copy()
 
 if filtered_df.empty:
-    st.warning("Select at least one charging station.")
+    st.warning("No data available for the selected stations.")
     st.stop()
 
-
-# ==================================================
-# DEFINE HIGH-ENERGY OUTLIERS
-# ==================================================
-
-valid_energy = filtered_df["energy_kwh"].dropna()
-
-if len(valid_energy) >= 4:
-
-    q1 = valid_energy.quantile(0.25)
-    q3 = valid_energy.quantile(0.75)
-    iqr = q3 - q1
-
-    high_energy_threshold = q3 + (1.5 * iqr)
-
-else:
-
-    q1 = 0
-    q3 = 0
-    iqr = 0
-    high_energy_threshold = float("inf")
-
-
-filtered_df["high_energy_outlier"] = (
-    filtered_df["energy_kwh"] > high_energy_threshold
-)
-
+# Apply the selected threshold.
 filtered_df["long_connection"] = (
     filtered_df["connection_duration_hours"]
-    > duration_threshold
+    > connection_threshold
 )
 
 filtered_df["long_connection_low_energy"] = (
     filtered_df["long_connection"]
-    & (filtered_df["energy_kwh"] < 10)
+    & (
+        filtered_df["energy_kwh"]
+        < filtered_df["energy_kwh"].median()
+    )
 )
 
 
-# ==================================================
-# KPI SUMMARY
-# ==================================================
-
-st.subheader("📊 Behavior Overview")
+# --------------------------------------------------
+# KEY METRICS
+# --------------------------------------------------
 
 total_sessions = len(filtered_df)
 
@@ -171,266 +189,249 @@ long_connections = int(
     filtered_df["long_connection"].sum()
 )
 
-high_energy_sessions = int(
+high_energy_outliers = int(
     filtered_df["high_energy_outlier"].sum()
 )
 
-long_low_energy_sessions = int(
-    filtered_df["long_connection_low_energy"].sum()
+missing_completion = int(
+    filtered_df["done_charging_time"].isna().sum()
 )
 
-col1, col2, col3, col4 = st.columns(4)
+c1, c2, c3, c4 = st.columns(4)
 
-col1.metric(
+c1.metric(
     "Total Sessions",
     f"{total_sessions:,}"
 )
 
-col2.metric(
+c2.metric(
     "Long Connections",
-    f"{long_connections:,}"
+    f"{long_connections:,}",
+    help="Connections exceeding your selected threshold."
 )
 
-col3.metric(
+c3.metric(
     "High-Energy Outliers",
-    f"{high_energy_sessions:,}"
+    f"{high_energy_outliers:,}"
 )
 
-col4.metric(
-    "Long + Low Energy",
-    f"{long_low_energy_sessions:,}"
+c4.metric(
+    "Missing Charging Completion",
+    f"{missing_completion:,}"
 )
 
 st.divider()
 
 
-# ==================================================
-# EXPLAIN THE RULES
-# ==================================================
-
-st.subheader("📖 How Are Unusual Sessions Identified?")
-
-rule1, rule2 = st.columns(2)
-
-with rule1:
-
-    st.markdown("**Long connection**")
-
-    st.write(
-        f"A session is flagged when its connection duration exceeds "
-        f"{duration_threshold} hours."
-    )
-
-with rule2:
-
-    st.markdown("**High-energy outlier**")
-
-    st.write(
-        "A session is flagged when its energy exceeds the statistical "
-        "upper boundary calculated as Q3 + 1.5 × IQR."
-    )
-
-st.info(
-    "These are investigation flags, not proof of a fault, fraud, "
-    "or abnormal vehicle behavior."
-)
-
-
-# ==================================================
+# --------------------------------------------------
 # CONNECTION DURATION DISTRIBUTION
-# ==================================================
+# --------------------------------------------------
 
 st.subheader("⏱️ Connection Duration Distribution")
 
 duration_data = filtered_df[
     filtered_df["connection_duration_hours"].notna()
-    & (filtered_df["connection_duration_hours"] >= 0)
-]
+].copy()
 
 if not duration_data.empty:
-
-    st.bar_chart(
-        duration_data["connection_duration_hours"]
-        .clip(upper=24)
-        .value_counts()
-        .sort_index(),
-        x_label="Connection Duration (hours, capped at 24)",
-        y_label="Number of Sessions"
+    fig_duration = px.histogram(
+        duration_data,
+        x="connection_duration_hours",
+        nbins=40,
+        title="Distribution of Vehicle Connection Duration",
+        labels={
+            "connection_duration_hours": "Connection Duration (Hours)",
+            "count": "Number of Sessions"
+        }
     )
 
-    st.caption(
-        "Durations above 24 hours are capped at 24 for this chart "
-        "to make the more common durations easier to inspect."
+    st.plotly_chart(
+        fig_duration,
+        use_container_width=True
     )
-
 else:
+    st.info("No valid connection-duration data is available.")
 
-    st.info("No valid connection durations are available.")
 
-
-# ==================================================
+# --------------------------------------------------
 # ENERGY DISTRIBUTION
-# ==================================================
-
-st.divider()
+# --------------------------------------------------
 
 st.subheader("⚡ Energy Delivered per Session")
 
-if not valid_energy.empty:
+energy_data = filtered_df[
+    filtered_df["energy_kwh"].notna()
+].copy()
 
-    st.write(
-        f"**Q1:** {q1:.2f} kWh"
+if not energy_data.empty:
+    fig_energy = px.histogram(
+        energy_data,
+        x="energy_kwh",
+        nbins=40,
+        title="Distribution of Energy Delivered",
+        labels={
+            "energy_kwh": "Energy Delivered (kWh)",
+            "count": "Number of Sessions"
+        }
     )
 
-    st.write(
-        f"**Median:** {valid_energy.median():.2f} kWh"
+    st.plotly_chart(
+        fig_energy,
+        use_container_width=True
     )
 
-    st.write(
-        f"**Q3:** {q3:.2f} kWh"
+
+# --------------------------------------------------
+# LONG CONNECTION ANALYSIS
+# --------------------------------------------------
+
+st.subheader("🚗 Long Connection Analysis")
+
+long_df = filtered_df[
+    filtered_df["long_connection"]
+].copy()
+
+if not long_df.empty:
+    fig_long = px.scatter(
+        long_df,
+        x="connection_duration_hours",
+        y="energy_kwh",
+        color="station_id",
+        hover_data=["session_id"],
+        title="Energy Delivered During Long Connections",
+        labels={
+            "connection_duration_hours": "Connection Duration (Hours)",
+            "energy_kwh": "Energy Delivered (kWh)",
+            "station_id": "Charging Station"
+        }
     )
 
-    st.write(
-        f"**High-energy investigation threshold:** "
-        f"{high_energy_threshold:.2f} kWh"
-    )
-
-    st.bar_chart(
-        filtered_df["energy_kwh"].dropna().clip(upper=40)
-        .value_counts()
-        .sort_index(),
-        x_label="Energy Delivered (kWh, capped at 40)",
-        y_label="Number of Sessions"
+    st.plotly_chart(
+        fig_long,
+        use_container_width=True
     )
 
     st.caption(
-        "Energy values above 40 kWh are capped in this chart only. "
-        "The underlying records remain unchanged."
+        "Long connection time does not necessarily mean long charging time. "
+        "A vehicle may remain connected after charging finishes."
+    )
+else:
+    st.info(
+        "No connections exceed the selected duration threshold."
     )
 
 
-# ==================================================
-# LONG CONNECTIONS
-# ==================================================
+# --------------------------------------------------
+# HIGH-ENERGY OUTLIERS
+# --------------------------------------------------
 
-st.divider()
-
-st.subheader("🚩 Long Connection Sessions")
-
-long_sessions = (
-    filtered_df[
-        filtered_df["long_connection"]
-    ]
-    .sort_values(
-        "connection_duration_hours",
-        ascending=False
-    )
-)
+st.subheader("⚠️ High-Energy Sessions")
 
 st.write(
-    f"Found **{len(long_sessions):,}** sessions exceeding "
-    f"{duration_threshold} hours with a valid connection duration."
+    f"The IQR method identifies sessions above "
+    f"**{energy_upper_bound:.2f} kWh** as potential high-energy outliers "
+    "in the full dataset. These sessions should be investigated, "
+    "not automatically treated as errors."
 )
 
-if not long_sessions.empty:
+outlier_df = filtered_df[
+    filtered_df["high_energy_outlier"]
+].copy()
 
+if not outlier_df.empty:
+    fig_outliers = px.scatter(
+        outlier_df,
+        x="connection_duration_hours",
+        y="energy_kwh",
+        color="station_id",
+        hover_data=["session_id"],
+        title="Potential High-Energy Outliers",
+        labels={
+            "connection_duration_hours": "Connection Duration (Hours)",
+            "energy_kwh": "Energy Delivered (kWh)",
+            "station_id": "Charging Station"
+        }
+    )
+
+    st.plotly_chart(
+        fig_outliers,
+        use_container_width=True
+    )
+else:
+    st.info("No high-energy outliers were found for these stations.")
+
+
+# --------------------------------------------------
+# LONG CONNECTION + LOW ENERGY
+# --------------------------------------------------
+
+st.subheader("🔎 Long Connections with Low Energy")
+
+low_energy_df = filtered_df[
+    filtered_df["long_connection_low_energy"]
+].copy()
+
+st.write(
+    "These sessions combine a long connection with energy below the "
+    "median for the currently selected stations. They may warrant review, "
+    "but the available data cannot establish the cause."
+)
+
+if not low_energy_df.empty:
     st.dataframe(
-        long_sessions[
+        low_energy_df[
             [
                 "session_id",
                 "station_id",
-                "connection_time",
-                "disconnect_time",
                 "connection_duration_hours",
+                "charging_duration_hours",
                 "energy_kwh"
             ]
-        ].round(2),
+        ].sort_values(
+            "connection_duration_hours",
+            ascending=False
+        ),
         use_container_width=True,
         hide_index=True
     )
-
-
-# ==================================================
-# LONG CONNECTIONS WITH LOW ENERGY
-# ==================================================
-
-st.divider()
-
-st.subheader("🔎 Long Connections with Less Than 10 kWh")
-
-low_energy_long = (
-    filtered_df[
-        filtered_df["long_connection_low_energy"]
-    ]
-    .sort_values(
-        "connection_duration_hours",
-        ascending=False
-    )
-)
-
-st.write(
-    f"Found **{len(low_energy_long):,}** sessions matching both conditions."
-)
-
-if not low_energy_long.empty:
-
-    st.dataframe(
-        low_energy_long[
-            [
-                "session_id",
-                "station_id",
-                "connection_duration_hours",
-                "energy_kwh",
-                "done_charging_time"
-            ]
-        ].round(2),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.info(
-        "Possible explanations include a vehicle remaining connected "
-        "after charging stopped, an interrupted charging session, "
-        "or incomplete records. The dataset alone cannot establish "
-        "which explanation applies."
-    )
-
 else:
+    st.success(
+        "No sessions match both conditions for the current filters."
+    )
 
-    st.success("No sessions match both selected conditions.")
 
-
-# ==================================================
+# --------------------------------------------------
 # STATION ANOMALY SUMMARY
-# ==================================================
+# --------------------------------------------------
 
-st.divider()
-
-st.subheader("🏢 Station Investigation Summary")
+st.subheader("🏭 Station Behavior Summary")
 
 station_summary = (
     filtered_df.groupby("station_id")
     .agg(
         total_sessions=("session_id", "count"),
+        total_energy_kwh=("energy_kwh", "sum"),
+        average_energy_kwh=("energy_kwh", "mean"),
+        average_connection_hours=(
+            "connection_duration_hours", "mean"
+        ),
         long_connections=("long_connection", "sum"),
         high_energy_outliers=("high_energy_outlier", "sum"),
-        average_energy_kwh=("energy_kwh", "mean")
+        long_connection_low_energy=(
+            "long_connection_low_energy", "sum"
+        )
     )
     .reset_index()
 )
 
 station_summary["long_connection_rate_percent"] = (
     station_summary["long_connections"]
-    / station_summary["total_sessions"] * 100
-)
-
-station_summary["high_energy_rate_percent"] = (
-    station_summary["high_energy_outliers"]
-    / station_summary["total_sessions"] * 100
+    / station_summary["total_sessions"]
+    * 100
 )
 
 station_summary = station_summary.sort_values(
-    "long_connections",
+    "long_connection_rate_percent",
     ascending=False
 )
 
@@ -441,50 +442,50 @@ st.dataframe(
 )
 
 
-# ==================================================
-# EXPORT RESULTS
-# ==================================================
+# --------------------------------------------------
+# DOWNLOAD RESULTS
+# --------------------------------------------------
 
-st.divider()
-
-st.subheader("📥 Download Analysis Results")
-
-csv_data = filtered_df.to_csv(index=False).encode("utf-8")
+st.subheader("📥 Export Analysis")
 
 st.download_button(
-    label="Download Analyzed Sessions (CSV)",
-    data=csv_data,
-    file_name="ev_charging_behavior_analysis.csv",
+    label="Download Filtered Sessions",
+    data=filtered_df.to_csv(index=False).encode("utf-8"),
+    file_name="charging_behavior_sessions.csv",
+    mime="text/csv"
+)
+
+st.download_button(
+    label="Download Station Behavior Summary",
+    data=station_summary.to_csv(index=False).encode("utf-8"),
+    file_name="station_behavior_summary.csv",
     mime="text/csv"
 )
 
 
-# ==================================================
-# BUSINESS RECOMMENDATIONS
-# ==================================================
+# --------------------------------------------------
+# BUSINESS NOTES
+# --------------------------------------------------
 
-st.divider()
+st.subheader("💡 How to Interpret These Flags")
 
-st.subheader("💡 Operational Recommendations")
+st.markdown(
+    """
+    - **Long connection:** The vehicle remained connected longer than
+      the selected threshold.
+    - **High-energy outlier:** The session delivered unusually high energy
+      relative to the full dataset, using the IQR method.
+    - **Long connection + low energy:** A session may deserve further
+      investigation because connection time was high while delivered
+      energy was below the selected stations' median.
+    - **Missing completion timestamp:** Charging completion time was not
+      recorded. This does not necessarily mean the session failed.
 
-st.markdown("""
-1. **Investigate long connections:** Determine whether extended connection
-   times are caused by customer behavior, charging interruptions, or
-   operational constraints.
-
-2. **Review high-energy sessions:** Compare flagged sessions with vehicle
-   capacity, station characteristics, and available operational records.
-
-3. **Compare stations fairly:** Consider session counts and sample sizes
-   before interpreting station-level rates.
-
-4. **Improve data quality:** Investigate missing charging completion
-   timestamps before drawing conclusions about actual charging duration.
-
-5. **Avoid premature conclusions:** Statistical outliers are candidates
-   for investigation, not confirmed equipment failures or misconduct.
-""")
+    These are analytical investigation flags, not confirmed faults,
+    fraud, or equipment failures.
+    """
+)
 
 st.caption(
-    "EV Charging Intelligence | Charging Behavior & Anomaly Analysis"
+    "Data source: EV Charging Sessions dataset."
 )
