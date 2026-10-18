@@ -21,3 +21,5 @@ app_backup.py
 
 # Temporary files
 *.log
+
+app_before_cloud.py
