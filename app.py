@@ -64,53 +64,73 @@ st.markdown("""
 # ==================================================
 # DATABASE CONNECTION
 # ==================================================
-
 @st.cache_data(ttl=60)
 def load_data():
 
-    connection = mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password=st.secrets["mysql"]["password"],
-        database="ev_charging_db"
-    )
+    # Load cleaned charging data
+    df = pd.read_csv("ev_charging_cleaned.csv")
 
-    try:
-        query = """
-            SELECT
-                session_id,
-                connection_time,
-                disconnect_time,
-                done_charging_time,
-                energy_kwh,
-                station_id,
-                site_id,
-                user_id
-            FROM charging_sessions
-        """
+    # Normalize original dataset column names
+    column_mapping = {
+        "_id": "record_id",
+        "clusterID": "cluster_id",
+        "connectionTime": "connection_time",
+        "disconnectTime": "disconnect_time",
+        "doneChargingTime": "done_charging_time",
+        "kWhDelivered": "energy_kwh",
+        "sessionID": "session_id",
+        "siteID": "site_id",
+        "spaceID": "space_id",
+        "stationID": "station_id",
+        "userID": "user_id",
+        "timezone": "timezone",
+        "userInputs": "user_inputs"
+    }
 
-        df = pd.read_sql(query, connection)
+    df = df.rename(columns=column_mapping)
 
-    finally:
-        connection.close()
+    # Validate essential columns
+    required_columns = [
+        "session_id",
+        "connection_time",
+        "energy_kwh",
+        "station_id"
+    ]
 
-    df["connection_time"] = pd.to_datetime(
-        df["connection_time"], errors="coerce"
-    )
+    missing_columns = [
+        column for column in required_columns
+        if column not in df.columns
+    ]
 
+    if missing_columns:
+        raise ValueError(
+            f"Missing required CSV columns: {missing_columns}. "
+            f"Available columns: {df.columns.tolist()}"
+        )
+
+    # Convert timestamps
+    for column in [
+        "connection_time",
+        "disconnect_time",
+        "done_charging_time"
+    ]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(
+                df[column],
+                errors="coerce",
+                utc=True
+            )
+
+    # Convert energy values to numeric
     df["energy_kwh"] = pd.to_numeric(
-        df["energy_kwh"], errors="coerce"
+        df["energy_kwh"],
+        errors="coerce"
     )
 
-    df["month"] = (
-        df["connection_time"]
-        .dt.to_period("M")
-        .astype("string")
-    )
+    # Create month column
+    df["month"] = df["connection_time"].dt.strftime("%Y-%m")
 
     return df
-
-
 # ==================================================
 # LOAD DATA
 # ==================================================
